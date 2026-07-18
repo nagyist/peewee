@@ -5,6 +5,7 @@ import itertools
 import json
 import logging
 import re
+import weakref
 
 from greenlet import greenlet, getcurrent
 from peewee import *
@@ -88,10 +89,12 @@ def await_(awaitable):
 
 
 class _State(object):
-    __slots__ = ('conn', 'closed', 'transactions', 'ctx', '_task_id')
+    __slots__ = ('conn', 'closed', 'transactions', 'ctx', '_task_id',
+                 '_task')
 
     def __init__(self):
         self._task_id = None
+        self._task = None
         self.reset()
 
     def reset(self):
@@ -134,6 +137,8 @@ class _ConnectionState(object):
         else:
             state = _State()
             state._task_id = tid
+            # Weak: only consulted for liveness, the owner keeps it alive.
+            state._task = weakref.ref(task)
             self._states[tid] = state
             task.add_done_callback(self._on_task_done)
 
@@ -314,10 +319,17 @@ class AsyncDatabaseMixin(object):
                     await asyncio.gather(*list(self._state._release_tasks),
                                          return_exceptions=True)
 
-                # Release connections held by any task still in the registry.
-                # Clear each state BEFORE the release await, else the task's
-                # done-callback can see the conn and double-release it.
-                for state in list(self._state._states.values()):
+                # Release conns held by the caller or by completed tasks.
+                # Live tasks are skipped: closing a conn under an in-flight
+                # query can hang aiosqlite forever. Their done-callback
+                # release closes the conn, the pool being gone. Reset state
+                # BEFORE the release await to prevent a double-release.
+                current = asyncio.current_task()
+                for tid, state in list(self._state._states.items()):
+                    task = state._task and state._task()
+                    if task and task is not current and not task.done():
+                        continue
+                    self._state._states.pop(tid, None)
                     if state.conn and not state.closed:
                         conn = state.conn
                         state.reset()
@@ -327,7 +339,6 @@ class AsyncDatabaseMixin(object):
                             logger.warning(
                                 'Error releasing connection during pool close',
                                 exc_info=True)
-                self._state._states.clear()
 
                 # Drain the fallback parking list (used when a task-done
                 # callback could not schedule a release).

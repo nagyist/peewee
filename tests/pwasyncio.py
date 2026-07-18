@@ -916,7 +916,7 @@ class IntegrationTests(object):
         tasks = [asyncio.ensure_future(worker()) for _ in range(6)]
         await asyncio.sleep(0.02)
         await asyncio.wait_for(db.close_pool(), timeout=10)
-        await asyncio.gather(*tasks)
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=15)
         # Surviving workers may have lazily recreated the pool.
         await asyncio.wait_for(db.close_pool(), timeout=10)
 
